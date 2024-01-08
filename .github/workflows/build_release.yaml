@@ -1,0 +1,107 @@
+name: Build and release
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            build-os: linux
+            build-arch: amd64
+          - runner: ubuntu-latest
+            build-os: linux
+            build-arch: arm64
+    runs-on: ${{ matrix.runner }}
+    name: "build (${{ matrix.build-os }}/${{ matrix.build-arch }})"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Tor
+        id: build_tor
+        run: |
+          source ./env.sh
+          if [[ "${{ matrix.build-os }}" == 'linux' && "${{ matrix.build-arch }}" == 'amd64' ]]; then
+            ./build_linux.sh
+            echo "built_docker_image_name=tor-brave" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ matrix.build-os }}" == 'linux' && "${{ matrix.build-arch }}" == 'arm64' ]]; then
+            ./build_linux_arm64.sh
+            echo "built_docker_image_name=tor-brave-arm64" >> "$GITHUB_OUTPUT"
+          else
+            echo >&2 "Unsupported build-os/build-arch combination: ${{ matrix.build-os }}/${{ matrix.build-arch }}"
+            exit 1
+          fi
+
+      - name: Prepare artifacts from built docker image
+        id: prepare_artifacts
+        if: ${{ matrix.build-os == 'linux' }}
+        run: |
+          source ./env.sh
+          set -x
+          docker run --rm -v "$PWD":/build --entrypoint cp "${{ steps.build_tor.outputs.built_docker_image_name }}" \
+            -vr \
+              "zlib-${ZLIB_VERSION}" \
+              "openssl-${OPENSSL_VERSION}" \
+              "libevent-${LIBEVENT_VERSION}" \
+              "tor-${TOR_VERSION}" \
+              /build
+
+          # Fix permissions so that the artifacts can be uploaded
+          sudo chown -R "$(id -u):$(id -g)" zlib-* openssl-* libevent-* tor-*
+          sudo chmod -R u+rwX,g+rwX,o+rX zlib-* openssl-* libevent-* tor-*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tor-libs-${{ matrix.build-os }}-${{ matrix.build-arch }}
+          path: |
+            zlib-*
+            openssl-*
+            libevent-*
+            tor-*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    name: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download linux/amd64 artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: tor-libs-linux-amd64
+          path: linux/amd64
+      - name: Compress linux/amd64 artifacts
+        run: tar -czf linux_amd64.tar.gz -C linux/amd64 .
+
+      - name: Download linux/arm64 artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: tor-libs-linux-arm64
+          path: linux/arm64
+      - name: Compress linux/arm64 artifacts
+        run: tar -czf linux_arm64.tar.gz -C linux/arm64 .
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          source ./env.sh
+          timestamp=$(date '+%Y%m%d%H%M%S')
+
+          cat > release-notes.txt <<EOF
+          - \`tor-${TOR_VERSION}\`
+          - \`libevent-${LIBEVENT_VERSION}\`
+          - \`openssl-${OPENSSL_VERSION}\`
+          - \`zlib-${ZLIB_VERSION}\`
+          EOF
+          gh release create \
+            --title "tor-libs-${TOR_VERSION} (${timestamp})" \
+            --notes-file release-notes.txt \
+            --latest \
+            "tor-libs-${TOR_VERSION}-${timestamp}" \
+            linux_amd64.tar.gz \
+            linux_arm64.tar.gz
